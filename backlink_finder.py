@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import codecs
 import csv
+import os
 import re
 import ssl
 import sys
@@ -26,12 +27,27 @@ from concurrent.futures import ThreadPoolExecutor
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urlparse, urljoin
-from urllib.request import Request, urlopen
+from urllib.request import Request, HTTPRedirectHandler, HTTPSHandler, build_opener
 from urllib.error import URLError, HTTPError
 
 _INSECURE_CTX = ssl.create_default_context()
 _INSECURE_CTX.check_hostname = False
 _INSECURE_CTX.verify_mode = ssl.CERT_NONE
+
+SCHEMES = ("http", "https")
+
+
+class HttpOnlyRedirect(HTTPRedirectHandler):
+    """urllib happily follows a redirect into ftp:// and friends. We don't."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if urlparse(newurl).scheme.lower() not in SCHEMES:
+            raise HTTPError(newurl, code, f"redirect to non-http(s) URL: {newurl}", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER = build_opener(HttpOnlyRedirect())
+_INSECURE_OPENER = build_opener(HttpOnlyRedirect(), HTTPSHandler(context=_INSECURE_CTX))
 
 DEFAULT_DOMAINS_FILE = "domains.txt"
 
@@ -50,20 +66,25 @@ def die(msg: str) -> "NoReturn":  # noqa: F821
     raise SystemExit(EXIT_USAGE)
 
 
+_LABEL = re.compile(r"^[a-z0-9_]([a-z0-9_-]*[a-z0-9_])?$")
+
+
 def canon_host(value: str) -> str:
-    """Canonicalize a host or a domain the user typed: strip scheme/path/port/userinfo,
-    a leading 'www.', a trailing dot, and IDNA-encode so unicode and punycode match."""
+    """Canonicalize a host or a domain the user typed: strip scheme/path/query/port/userinfo,
+    a leading 'www.', a trailing dot, and IDNA-encode so unicode and punycode match.
+    Returns "" for anything that is not a usable host."""
     h = value.strip().lower()
     if not h:
         return ""
     if "//" in h:
-        h = urlparse(h).hostname or ""
+        h = urlparse(h).hostname or ""      # already unbracketed and lowercased
     else:
-        h = h.split("/")[0].split("@")[-1]
-        # strip :port, but leave a bare IPv6 literal alone
-        if not h.startswith("[") and ":" in h:
-            h = h.split(":")[0]
-    h = h.strip(".")
+        h = h.split("/")[0].split("?")[0].split("#")[0].split("@")[-1]
+        if h.startswith("[") and "]" in h:  # [2001:db8::1]:8080
+            h = h[1:h.index("]")]
+    if h.count(":") >= 2:                   # IPv6 literal: no ports, no IDNA, no www
+        return h
+    h = h.split(":")[0].strip(".")
     if h.startswith("www."):
         h = h[4:]
     if not h:
@@ -71,7 +92,9 @@ def canon_host(value: str) -> str:
     try:
         h = h.encode("idna").decode("ascii")
     except (UnicodeError, UnicodeDecodeError):
-        pass
+        return ""                           # empty or over-long label
+    if not all(_LABEL.match(part) for part in h.split(".")):
+        return ""                           # leading/trailing hyphen, stray characters
     return h
 
 
@@ -89,11 +112,14 @@ def domain_matches(host: str, our: list[str]) -> str | None:
 
 
 class LinkExtractor(HTMLParser):
+    """Collect <a href> with anchor text. Nested anchors are invalid HTML; like a browser,
+    an opening <a> closes the one before it, so text never leaks between links."""
+
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.links: list[dict] = []
         self.base_href: str | None = None
-        self._anchors: list[dict] = []   # stack, tolerates malformed nesting
+        self._anchor: dict | None = None
         self._skip_depth = 0             # inside <script>/<style>
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
@@ -107,41 +133,43 @@ class LinkExtractor(HTMLParser):
             if href:
                 self.base_href = href
             return
-        if tag == "img" and self._anchors:
+        if tag == "img" and self._anchor is not None:
             alt = (a.get("alt") or "").strip()
             if alt:
-                self._anchors[-1]["text"] += " " + alt
+                self._anchor["text"] += " " + alt
             return
         if tag != "a":
             return
+        self._anchor = None              # an <a> always ends the previous one
         href = (a.get("href") or "").strip()
         if not href:
             return
         rel = (a.get("rel") or "").strip()
-        anchor = {
+        self._anchor = {
             "href": href,
             "rel": rel,
             "nofollow": "nofollow" in rel.lower().split(),
             "text": "",
         }
-        self._anchors.append(anchor)
-        self.links.append(anchor)
+        self.links.append(self._anchor)
 
     def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        # <base ... /> and <img ... /> must not push/pop skip state
-        if tag.lower() in ("base", "img"):
+        # <base/>, <img/> and <a/> must not touch the script/style depth
+        if tag.lower() in ("base", "img", "a"):
             self.handle_starttag(tag, attrs)
+            if tag.lower() == "a":
+                self._anchor = None
 
     def handle_endtag(self, tag: str) -> None:
         tag = tag.lower()
         if tag in ("script", "style"):
             self._skip_depth = max(0, self._skip_depth - 1)
-        elif tag == "a" and self._anchors:
-            self._anchors.pop()
+        elif tag == "a":
+            self._anchor = None
 
     def handle_data(self, data: str) -> None:
-        if self._skip_depth == 0 and self._anchors:
-            self._anchors[-1]["text"] += data
+        if self._skip_depth == 0 and self._anchor is not None:
+            self._anchor["text"] += data
 
 
 def _is_ssl_error(reason: object) -> bool:
@@ -160,13 +188,13 @@ def fetch(url: str, insecure: bool) -> tuple[str, bytes | None, str | None, str 
     insecure_used = False
     attempts = (False, True) if insecure else (False,)
     for use_insecure in attempts:
-        ctx = _INSECURE_CTX if use_insecure else None
+        opener = _INSECURE_OPENER if use_insecure else _OPENER
         try:
             req = Request(
                 url,
                 headers={"User-Agent": UA, "Accept": "text/html,*/*", "Accept-Encoding": "identity"},
             )
-            with urlopen(req, timeout=TIMEOUT_SEC, context=ctx) as resp:
+            with opener.open(req, timeout=TIMEOUT_SEC) as resp:
                 final = resp.geturl() or url
                 ctype = _content_type(resp.headers.get("Content-Type"))
                 if ctype not in GENERIC_CTYPES and not ctype.startswith(HTML_CTYPES):
@@ -180,7 +208,9 @@ def fetch(url: str, insecure: bool) -> tuple[str, bytes | None, str | None, str 
                 charset = resp.headers.get_content_charset()
                 return final, data, charset or ctype, None, insecure_used
         except HTTPError as e:
-            return url, None, None, f"HTTP {e.code}", insecure_used
+            with e:  # an HTTPError is also an open response
+                reason = f"HTTP {e.code}" if e.code >= 400 else f"{e.reason}"
+            return url, None, None, reason, insecure_used
         except URLError as e:
             if not use_insecure and insecure and _is_ssl_error(e.reason):
                 insecure_used = True
@@ -199,14 +229,15 @@ def fetch(url: str, insecure: bool) -> tuple[str, bytes | None, str | None, str 
 
 
 _META_CHARSET = re.compile(rb"""<meta[^>]+charset=["']?\s*([\w.:+-]+)""", re.I)
-_XML_ENCODING = re.compile(rb"""encoding=["']([\w.:+-]+)["']""", re.I)
+_XML_DECL = re.compile(rb"""^\s*<\?xml[^>]*?encoding=["']([\w.:+-]+)["']""", re.I)
 
 
 def decode_html(raw: bytes, declared: str | None = None) -> str:
-    """Decode using BOM > HTTP charset > <meta charset> / XML declaration > utf-8 > cp1252."""
+    """Decode using BOM > HTTP charset > <meta charset> / <?xml?> > utf-8 > cp1252."""
     if raw.startswith(codecs.BOM_UTF8):
         return raw[len(codecs.BOM_UTF8):].decode("utf-8", errors="replace")
-    for bom, enc in ((codecs.BOM_UTF16_LE, "utf-16-le"), (codecs.BOM_UTF16_BE, "utf-16-be")):
+    for bom, enc in ((codecs.BOM_UTF32_LE, "utf-32-le"), (codecs.BOM_UTF32_BE, "utf-32-be"),
+                     (codecs.BOM_UTF16_LE, "utf-16-le"), (codecs.BOM_UTF16_BE, "utf-16-be")):
         if raw.startswith(bom):
             return raw[len(bom):].decode(enc, errors="replace")
 
@@ -214,7 +245,7 @@ def decode_html(raw: bytes, declared: str | None = None) -> str:
     if declared and "/" not in declared:
         candidates.append(declared)
     head = raw[:4096]
-    for rx in (_META_CHARSET, _XML_ENCODING):
+    for rx in (_META_CHARSET, _XML_DECL):
         m = rx.search(head)
         if m:
             candidates.append(m.group(1).decode("ascii", errors="ignore"))
@@ -250,6 +281,9 @@ def _row(source: str, error: str = "", **kw) -> dict:
 def scan(url: str, our: list[str], insecure: bool) -> tuple[list[dict], bool]:
     """Returns (rows, insecure_used). `source_url` stays the requested URL, so rows join
     back to the input list; relative links resolve against the final (post-redirect) URL."""
+    if urlparse(url).scheme.lower() not in SCHEMES:
+        return [_row(url, error="unsupported scheme (http/https only)")], False
+
     final, raw, declared, err, insecure_used = fetch(url, insecure)
     if raw is None:
         return [_row(url, error=err or "")], insecure_used
@@ -258,6 +292,7 @@ def scan(url: str, our: list[str], insecure: bool) -> tuple[list[dict], bool]:
     p = LinkExtractor()
     try:
         p.feed(html)
+        p.close()          # flush anything the parser is still holding
     except Exception as e:
         return [_row(url, error=f"parse: {e}")], insecure_used
 
@@ -381,6 +416,8 @@ def main() -> int:
             rows, used = [_row(u, error=f"{type(e).__name__}: {e}")], False
         return u, rows, used
 
+    write_error: str | None = None
+    broken_pipe = False
     try:
         with ThreadPoolExecutor(max_workers=args.workers) as ex:
             for url, rows, insecure_used in ex.map(run, urls):  # input order, streamed
@@ -413,9 +450,27 @@ def main() -> int:
                             error_counter["parse"] += 1
                         else:
                             error_counter["other"] += 1
+    except BrokenPipeError:
+        broken_pipe = True            # downstream closed the pipe, e.g. `| head`
+    except OSError as e:
+        write_error = f"cannot write output: {e.strerror or e}"
     finally:
-        if out is not sys.stdout:
-            out.close()
+        try:
+            if out is not sys.stdout:
+                out.close()
+            else:
+                out.flush()
+        except BrokenPipeError:
+            broken_pipe = True
+        except (OSError, ValueError) as e:
+            write_error = write_error or f"cannot write output: {getattr(e, 'strerror', None) or e}"
+
+    if broken_pipe:
+        # keep the interpreter from raising again while flushing at exit
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        return EXIT_OK
+    if write_error:
+        die(write_error)
 
     # ---- Final report (stderr so it doesn't pollute CSV stdout) ----
     sources_clean = total_urls - len(sources_with_match) - len(sources_with_error)

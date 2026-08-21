@@ -48,7 +48,9 @@ If `./domains.txt` exists it is picked up automatically, so plain
 
 A domain can be written any way you happen to have it — `mysite.com`,
 `www.mysite.com`, `https://mysite.com/path`, `MySite.com.`, `mysite.com:443`
-all mean the same host. Unicode domains and their punycode form match each other.
+all mean the same host. Unicode domains and their punycode form match each other,
+and anything that isn't a usable host (`a..com`, `-bad.com`) is rejected up front
+rather than silently matching nothing.
 
 ## Try it without touching the network
 
@@ -79,7 +81,8 @@ python3 backlink_finder.py examples/urls.txt --domains-file examples/domains.txt
 ## Output
 
 CSV goes to stdout (or `--out FILE`) **in input order**; the run summary goes to **stderr**,
-so piping stays clean.
+so piping stays clean. The whole URL list is held in memory and every job is submitted at
+once — fine for outreach sheets, not meant for million-line crawls.
 
 | Column | Meaning |
 |---|---|
@@ -136,18 +139,20 @@ The stderr summary looks like this:
 At least one domain must be supplied via `--domains` or `--domains-file`.
 
 Exit codes: `0` when the scan ran to completion (per-page failures are reported in the
-`error` column, not via the exit status), `2` for usage problems — no domains, an unreadable
-input file, an unwritable `--out` path, a bad `--workers` value.
+`error` column, not via the exit status), `2` for usage and output problems — no usable
+domain, an unreadable input file, an unwritable or failing `--out` path, a bad `--workers`
+value. Closing the pipe early (`| head`) exits `0` quietly.
 
 ## Behaviour notes
 
 - **Subdomains match.** `mysite.com` also matches `www.mysite.com` and `blog.mysite.com`. If you configure both `mysite.com` and `shop.mysite.com`, the more specific one is reported.
-- **Redirects are followed**, and relative links are resolved against the page that actually answered — via `<base href>` when the page sets one.
+- **Redirects are followed** (to `http(s)` only — a redirect into another scheme is reported as an error), and relative links are resolved against the page that actually answered, via `<base href>` when the page sets one.
 - **Deduplicated per source.** The same target URL linked twice with the *same* anchor and `rel` is reported once; a second link with different anchor text is kept.
-- **Only `http(s)` links are considered** — `mailto:`, `tel:`, `javascript:`, `#anchor` and other schemes are skipped.
-- **Encoding** comes from the BOM, then the HTTP `charset`, then `<meta charset>` / the XML declaration, then UTF-8, then CP1252.
+- **Only `http(s)` links are considered** — `mailto:`, `tel:`, `javascript:`, `#anchor` and other schemes are skipped, on input URLs as well as on extracted links.
+- **Nested anchors close like a browser closes them**: an opening `<a>` ends the previous one, so text never leaks from one link into another.
+- **Encoding** comes from the BOM (UTF-8/16/32), then the HTTP `charset`, then `<meta charset>` or an `<?xml?>` declaration, then UTF-8, then CP1252.
 - **Broken TLS fails by default.** Many small donor sites have expired certificates; `--insecure` retries those with verification off, and the summary counts how many pages were accepted that way. Content fetched this way is not authenticated — treat it accordingly.
-- **Pages over 4 MB are skipped** (by `Content-Length` when the server declares one). Responses are requested uncompressed.
+- **4 MB defensive size limit.** A response is skipped when the server *declares* more than that in `Content-Length` (an untrusted claim — a lying header will skip a small page) or when the body actually exceeds it. Responses are requested uncompressed (`Accept-Encoding: identity`).
 - **Non-HTML responses are skipped**; a missing or generic `Content-Type` is still parsed.
 - **Raw HTML only.** Links injected by JavaScript after page load are not seen; the parser is `html.parser`, not a browser.
 
@@ -158,6 +163,8 @@ python3 -m unittest -v
 ```
 
 Stdlib `unittest` against a local `http.server` — no network, no dependencies.
+44 tests covering matching, redirects, `<base>`, encodings, domain canonicalization,
+row semantics and CLI exit behaviour.
 
 ## Politeness
 

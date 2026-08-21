@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Stdlib-only tests: python3 -m unittest -v (or ./test_backlink_finder.py)."""
 
+import codecs
 import csv
 import io
 import subprocess
@@ -38,6 +39,22 @@ PAGES = {
     "/gone": (404, "text/html", b"nope"),
     "/pdfish": (200, "application/pdf", b"%PDF-1.4"),
     "/notype": (200, None, b'<a href="https://mysite.com/nt">no ctype</a>'),
+    "/selfclosing": (200, "text/html", b'<a href="https://mysite.com/sc"/>after'),
+    "/nested": (200, "text/html", b'<a href="https://mysite.com/outer">before<a>x</a>after</a>'),
+    "/trailing": (200, "text/html", b'<a href="https://mysite.com/t">tail &amp'),
+    "/utf16": (200, "text/html",
+               codecs.BOM_UTF16_LE + '<a href="https://mysite.com/16">ü16</a>'.encode("utf-16-le")),
+    "/utf32": (200, "text/html",
+               codecs.BOM_UTF32_LE + '<a href="https://mysite.com/32">ü32</a>'.encode("utf-32-le")),
+    "/xmldecl": (200, "text/html",
+                 '<?xml version="1.0" encoding="cp1251"?><a href="https://mysite.com/x">Казино</a>'.encode("cp1251")),
+    "/fakeattr": (200, "text/html",
+                  '<div encoding="latin-1"></div><a href="https://mysite.com/f">über</a>'.encode("utf-8")),
+    "/badcharset": (200, "text/html; charset=nonsense-9",
+                    '<a href="https://mysite.com/b">plain</a>'.encode("utf-8")),
+    "/cp1252": (200, "text/html", b'<a href="https://mysite.com/c">caf\xe9</a>'),
+    "/relmix": (200, "text/html", b'<a href="https://mysite.com/r">same</a>'
+                                  b'<a href="https://mysite.com/r" rel="nofollow">same</a>'),
 }
 
 
@@ -47,6 +64,19 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(302)
             self.send_header("Location", "/relative")
             self.end_headers()
+            return
+        if self.path == "/ftpredirect":
+            self.send_response(302)
+            self.send_header("Location", "ftp://files.example.com/x")
+            self.end_headers()
+            return
+        if self.path == "/biglie":
+            body = b'<a href="https://mysite.com/big">tiny</a>'
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", "99999999")
+            self.end_headers()
+            self.wfile.write(body)
             return
         if self.path not in PAGES:
             self.send_error(404)
@@ -124,12 +154,59 @@ class TestMatching(ServerCase):
         self.assertEqual(got[0]["found_domain"], "shop.mysite.com")
 
 
+class TestParsing(ServerCase):
+    def test_self_closing_anchor_is_found(self):
+        got = self.links("/selfclosing")
+        self.assertEqual(got[0]["link_url"], "https://mysite.com/sc")
+        self.assertEqual(got[0]["anchor_text"], "")   # text after <a/> belongs to no link
+
+    def test_nested_anchor_does_not_swallow_text(self):
+        got = self.links("/nested")
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["anchor_text"], "before")
+
+    def test_trailing_buffered_text_is_flushed(self):
+        self.assertEqual(self.links("/trailing")[0]["anchor_text"], "tail &")
+
+    def test_same_url_and_text_but_different_rel_are_both_kept(self):
+        got = self.links("/relmix")
+        self.assertEqual([r["nofollow"] for r in got], ["", "yes"])
+
+
+class TestSchemes(ServerCase):
+    def test_non_http_input_url_is_rejected(self):
+        rows, _ = bf.scan("ftp://files.example.com/x", ["mysite.com"], False)
+        self.assertIn("unsupported scheme", rows[0]["error"])
+
+    def test_redirect_into_non_http_is_blocked(self):
+        row, = self.rows("/ftpredirect")
+        self.assertIn("non-http(s)", row["error"])
+
+
 class TestEncoding(ServerCase):
     def test_http_charset_header_is_honoured(self):
         self.assertEqual(self.links("/cp1251")[0]["anchor_text"], "Казино")
 
     def test_meta_charset_is_honoured(self):
         self.assertEqual(self.links("/metacharset")[0]["anchor_text"], "über")
+
+    def test_xml_declaration_is_honoured(self):
+        self.assertEqual(self.links("/xmldecl")[0]["anchor_text"], "Казино")
+
+    def test_encoding_attribute_outside_xml_declaration_is_ignored(self):
+        self.assertEqual(self.links("/fakeattr")[0]["anchor_text"], "über")
+
+    def test_utf16_bom(self):
+        self.assertEqual(self.links("/utf16")[0]["anchor_text"], "ü16")
+
+    def test_utf32_bom_is_not_mistaken_for_utf16(self):
+        self.assertEqual(self.links("/utf32")[0]["anchor_text"], "ü32")
+
+    def test_unknown_declared_charset_falls_back(self):
+        self.assertEqual(self.links("/badcharset")[0]["anchor_text"], "plain")
+
+    def test_cp1252_fallback_for_undeclared_legacy_bytes(self):
+        self.assertEqual(self.links("/cp1252")[0]["anchor_text"], "café")
 
 
 class TestRowSemantics(ServerCase):
@@ -148,6 +225,10 @@ class TestRowSemantics(ServerCase):
     def test_missing_content_type_is_still_scanned(self):
         self.assertEqual(len(self.links("/notype")), 1)
 
+    def test_declared_oversize_is_skipped_without_downloading(self):
+        row, = self.rows("/biglie")
+        self.assertIn("4MB", row["error"])
+
 
 class TestCanonHost(unittest.TestCase):
     def test_accepts_what_users_actually_paste(self):
@@ -157,6 +238,18 @@ class TestCanonHost(unittest.TestCase):
 
     def test_idn_and_punycode_are_the_same_host(self):
         self.assertEqual(bf.canon_host("bücher.de"), bf.canon_host("xn--bcher-kva.de"))
+
+    def test_ipv6_literals_canonicalize_consistently(self):
+        want = "2001:db8::1"
+        for raw in ("[2001:db8::1]", "2001:DB8::1", "http://[2001:db8::1]:8080/x"):
+            self.assertEqual(bf.canon_host(raw), want, raw)
+
+    def test_invalid_domains_are_rejected(self):
+        for raw in ("a..com", "-bad.com", "bad-.com", "", "   ", "x" * 70 + ".com"):
+            self.assertEqual(bf.canon_host(raw), "", repr(raw))
+
+    def test_query_string_is_stripped_from_a_bare_domain(self):
+        self.assertEqual(bf.canon_host("mysite.com?x=1"), "mysite.com")
 
     def test_subdomain_matches_apex_but_not_a_lookalike(self):
         self.assertEqual(bf.domain_matches("blog.mysite.com", ["mysite.com"]), "mysite.com")
@@ -219,6 +312,22 @@ class TestCli(ServerCase):
             self.assertEqual([row["source_url"] for row in rows],
                              [self.base + "/empty", self.base + "/plain", self.base + "/plain"])
             self.assertIn("URLs scanned                : 2", r.stderr)
+
+    def test_all_domains_invalid_is_a_usage_error(self):
+        r = self.run_cli("x.txt", "--domains", "a..com,-bad.com")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("no usable domain", r.stderr)
+
+    def test_broken_pipe_does_not_traceback(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            urls = Path(tmp) / "u.txt"
+            urls.write_text("\n".join(f"{self.base}/plain" for _ in range(1)) + "\n")
+            proc = subprocess.run(
+                f"{sys.executable} {SCRIPT} {urls} --domains mysite.com 2>/dev/null | head -1",
+                shell=True, capture_output=True, text=True, cwd=tmp)
+            self.assertEqual(proc.returncode, 0)
+            self.assertNotIn("Traceback", proc.stderr)
 
     def test_domains_file_is_picked_up_from_cwd(self):
         import tempfile
