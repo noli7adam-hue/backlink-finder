@@ -1,0 +1,10 @@
+# your own domain list stays local
+/domains.txt
+/urls.txt
+*.csv
+!examples/sample_output.csv
+
+__pycache__/
+*.pyc
+.venv/
+.DS_Store

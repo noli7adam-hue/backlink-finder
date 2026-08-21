@@ -1,0 +1,3 @@
+source_url,found_domain,link_url,anchor_text,rel,nofollow,error
+http://127.0.0.1:8765/page.html,mysite.com,https://mysite.com/best-guide/,best guide to widgets,,,
+http://127.0.0.1:8765/page.html,mysite.com,https://www.mysite.com/deals,check the deals,nofollow sponsored,yes,

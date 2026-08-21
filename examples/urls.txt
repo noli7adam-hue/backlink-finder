@@ -1,0 +1,4 @@
+# One URL per line. Blank lines and #-comments are ignored.
+https://www.iana.org/help/example-domains
+https://www.rfc-editor.org/rfc/rfc2606.html
+https://example.com/

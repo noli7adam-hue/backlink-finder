@@ -1,0 +1,3 @@
+# One domain per line. Blank lines and #-comments are ignored.
+# Subdomains match automatically: "iana.org" also matches "www.iana.org".
+iana.org
