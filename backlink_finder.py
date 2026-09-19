@@ -332,6 +332,94 @@ def scan(url: str, our: list[str], insecure: bool) -> tuple[list[dict], bool]:
     return rows, insecure_used
 
 
+# ---------------------------------------------------------------------------
+# Фильтр служебных ссылок («навигация площадки»).
+#
+# Сканер отдаёт ВСЕ ссылки на заданный домен — включая меню, логотип, футер,
+# хлебные крошки и пагинацию. Для проверки размещений это шум: интересует
+# ссылка с осмысленным анкором, а не навигация самого донора. Ниже — эвристика
+# с четырьмя причинами; срабатывание любой означает «служебная».
+# ---------------------------------------------------------------------------
+
+# Анкоры, которые на сайтах-донорах практически всегда означают навигацию.
+_NAV_ANCHORS = {
+    # ru
+    "главная", "на главную", "главная страница", "о нас", "о компании", "о сайте",
+    "контакты", "контакт", "обратная связь", "вопросы", "вопросы и ответы",
+    "блог", "новости", "войти", "вход", "регистрация", "зарегистрироваться",
+    "меню", "ещё", "еще", "показать ещё", "показать все", "далее", "назад",
+    "следующий", "предыдущий", "партнеры", "партнёры", "каталог", "корзина",
+    "поиск", "подписаться", "настройки", "профиль", "аккаунт", "личный кабинет",
+    "выйти", "карта сайта", "политика конфиденциальности", "политика",
+    "условия", "пользовательское соглашение", "cookies", "cookie", "язык",
+    "поддержка", "помощь", "документация", "реклама", "авторизация",
+    # en
+    "home", "homepage", "about", "about us", "contacts", "contact", "contact us",
+    "faq", "blog", "news", "login", "log in", "sign in", "signin", "register",
+    "sign up", "signup", "join", "menu", "more", "show more", "show all",
+    "next", "previous", "prev", "back", "partners", "catalog", "cart", "basket",
+    "search", "subscribe", "settings", "profile", "account", "my account",
+    "logout", "log out", "sign out", "sitemap", "privacy", "privacy policy",
+    "terms", "terms of use", "language", "support", "help", "docs",
+    "documentation", "advertise", "authorization",
+}
+
+# Служебные пути: ссылка на них — навигация, а не размещение.
+_NAV_PATHS = {
+    "/about", "/about-us", "/o-nas", "/contacts", "/contact", "/kontakty", "/faq",
+    "/login", "/signin", "/sign-in", "/register", "/signup", "/sign-up", "/join",
+    "/cart", "/basket", "/search", "/menu", "/sitemap", "/feed", "/rss",
+    "/privacy", "/privacy-policy", "/terms", "/policy", "/profile", "/account",
+    "/settings", "/logout", "/auth", "/help", "/support", "/docs", "/partners",
+    "/blog", "/news", "/catalog", "/category", "/tags", "/tag",
+}
+
+_NAV_PATH_RE = re.compile(r"^/(?:page|p)/\d+$")
+_NAV_QUERY_RE = re.compile(r"(?:^|&)(?:page|p|paged|pg|offset)=\d+(?:&|$)")
+_ANCHOR_EDGE = " \t\n\r→»«\"'`.,:;!?|—–-()[]"
+
+
+def nav_reason(link_url: str, anchor_text: str, source_url: str) -> str:
+    """Почему ссылку считаем служебной: anchor-empty | self-link | url-root |
+    url-service | url-pagination | anchor-nav. Пустая строка — обычная ссылка.
+
+    Разделение важно: признаки, привязанные к адресу (корень сайта, служебный
+    путь, пагинация), применяются только к ВНУТРЕННИМ ссылкам площадки — иначе
+    можно выбросить реальное размещение, которое ведёт на наш корень.
+    Анкорные признаки (пустой анкор, навигационное слово) применяются всегда:
+    так выглядят шаблонные ссылки в меню и футере."""
+    anchor = _WS.sub(" ", (anchor_text or "")).strip().lower().replace("ё", "е")
+    anchor = anchor.strip(_ANCHOR_EDGE).strip()
+
+    # 1. Пустой или чисто декоративный анкор (картинка, иконка, счётчик).
+    if not re.search(r"[0-9a-zа-я]", anchor):
+        return "anchor-empty"
+
+    a, s = urlparse(link_url), urlparse(source_url)
+    internal = a.netloc.lower() == s.netloc.lower()
+
+    # 2. Ссылка на саму эту же страницу — логотип, «наверх», хлебные крошки.
+    if internal and (a.path or "/").rstrip("/") == (s.path or "/").rstrip("/"):
+        return "self-link"
+
+    if internal:
+        path = (a.path or "/").rstrip("/").lower() or "/"
+        # 3. Корень сайта и служебные разделы площадки.
+        if path == "/":
+            return "url-root"
+        if path in _NAV_PATHS or _NAV_PATH_RE.match(path):
+            return "url-service"
+        # 4. Пагинация: /page/2, ?page=2, ?p=3 …
+        if _NAV_QUERY_RE.search(a.query or ""):
+            return "url-pagination"
+
+    # 5. Анкор из навигационного словаря — шаблонная ссылка.
+    if anchor in _NAV_ANCHORS:
+        return "anchor-nav"
+
+    return ""
+
+
 def positive_int(value: str) -> int:
     try:
         n = int(value)
@@ -360,6 +448,10 @@ def main() -> int:
     ap.add_argument("--domains-file", default="", help=f"file with one domain per line (default: ./{DEFAULT_DOMAINS_FILE} if it exists)")
     ap.add_argument("--workers", type=positive_int, default=8, help="parallel HTTP workers, 1-64 (default 8)")
     ap.add_argument("--insecure", action="store_true", help="retry TLS failures with certificate verification OFF")
+    ap.add_argument("--nav-filter", choices=("on", "off"), default="on",
+                    help="drop site navigation (menu, logo, footer, breadcrumbs, pagination) from the report; "
+                         "'off' restores upstream behaviour (default on)")
+    ap.add_argument("--nav-out", default="", help="optional CSV path to also write the rows dropped as navigation")
     args = ap.parse_args()
 
     raw_domains: list[str] = []
@@ -399,6 +491,24 @@ def main() -> int:
     )
     writer.writeheader()
 
+    nav_filter_on = args.nav_filter == "on"
+    nav_writer = None
+    nav_out_fh = None
+    if args.nav_out:
+        try:
+            nav_out_fh = open(args.nav_out, "w", encoding="utf-8", newline="")
+        except OSError as e:
+            die(f"cannot write --nav-out {args.nav_out!r}: {e.strerror or e}")
+        nav_writer = csv.DictWriter(
+            nav_out_fh,
+            fieldnames=["source_url", "found_domain", "link_url", "anchor_text", "rel", "nofollow", "error"],
+        )
+        nav_writer.writeheader()
+
+    nav_filtered = 0
+    nav_reason_counter: Counter[str] = Counter()
+    nav_only_sources: set[str] = set()
+
     total_urls = len(urls)
     found_link_count = 0           # number of (source × link × our-domain) rows
     sources_with_match: set[str] = set()
@@ -425,7 +535,20 @@ def main() -> int:
                     insecure_count += 1
                     if len(insecure_examples) < 5:
                         insecure_examples.append(url)
+                url_matched = 0
+                url_kept = 0
                 for r in rows:
+                    if r["found_domain"]:
+                        url_matched += 1
+                        if nav_filter_on:
+                            reason = nav_reason(r["link_url"], r["anchor_text"], r["source_url"])
+                            if reason:
+                                nav_filtered += 1
+                                nav_reason_counter[reason] += 1
+                                if nav_writer is not None:
+                                    nav_writer.writerow(r)
+                                continue
+                        url_kept += 1
                     writer.writerow(r)
                     if r["found_domain"]:
                         found_link_count += 1
@@ -450,11 +573,19 @@ def main() -> int:
                             error_counter["parse"] += 1
                         else:
                             error_counter["other"] += 1
+                if url_matched and not url_kept:
+                    # Всё, что нашлось на источнике, оказалось навигацией.
+                    nav_only_sources.add(url)
     except BrokenPipeError:
         broken_pipe = True            # downstream closed the pipe, e.g. `| head`
     except OSError as e:
         write_error = f"cannot write output: {e.strerror or e}"
     finally:
+        try:
+            if nav_out_fh is not None:
+                nav_out_fh.close()
+        except OSError:
+            pass
         try:
             if out is not sys.stdout:
                 out.close()
@@ -481,6 +612,19 @@ def main() -> int:
     print(f"  Sources with ZERO matches   : {max(0, sources_clean)}", file=sys.stderr)
     print(f"  Sources with errors         : {len(sources_with_error)}", file=sys.stderr)
     print(f"  Total link occurrences      : {found_link_count}", file=sys.stderr)
+    if nav_filter_on:
+        print("  --- Navigation filter (on) ---", file=sys.stderr)
+        detail = ""
+        if nav_filtered:
+            detail = "  reasons: " + ", ".join(f"{k} {v}" for k, v in nav_reason_counter.most_common())
+        print(f"    dropped as navigation    : {nav_filtered} link(s){detail}", file=sys.stderr)
+        if nav_only_sources:
+            print(f"    sources whose only matches were navigation: {len(nav_only_sources)}"
+                  "  (they count towards ZERO matches above)", file=sys.stderr)
+        if nav_filtered == 0:
+            print("    (nothing looked like site navigation on these pages)", file=sys.stderr)
+    else:
+        print("  Navigation filter           : off (upstream behaviour)", file=sys.stderr)
     if args.insecure:
         print(f"  Scanned with TLS verify OFF : {insecure_count}"
               + (f"  e.g. {', '.join(insecure_examples[:3])}" if insecure_examples else ""),

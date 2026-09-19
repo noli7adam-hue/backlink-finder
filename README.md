@@ -125,6 +125,42 @@ The stderr summary looks like this:
 =====================================================================
 ```
 
+## Site navigation filter (added in this fork)
+
+A donor page linking to your domain is not automatically a placement: menus, logos,
+footers, breadcrumbs and pagination produce rows too. With the filter on (default), such
+links are dropped from the report, so the CSV holds placements rather than chrome.
+
+```
+  Total link occurrences      : 356
+  --- Navigation filter (on) ---
+    dropped as navigation    : 161 link(s)  reasons: anchor-empty 88, self-link 28, url-service 26, anchor-nav 19
+```
+
+(Real run: 7 live pages scanned for four domains — 518 raw rows became 356, and the 161
+dropped ones were menus, logos, breadcrumbs and pagination, not placements. When everything
+a source had was navigation, an extra line reports how many such sources there were.)
+
+Six reasons, and the split matters:
+
+| Reason | Example | Applies to |
+|---|---|---|
+| `anchor-empty` | logo `<img>` with no alt | any link |
+| `anchor-nav` | «Главная», «О нас», `Login`, `More`, `Privacy` | any link |
+| `self-link` | link back to the very page being scanned | internal only |
+| `url-root` | link to the site root `/` | internal only |
+| `url-service` | `/about`, `/faq`, `/cart`, `/page/3`, `/policy` … | internal only |
+| `url-pagination` | `?page=2`, `?p=3`, `?offset=20` | internal only |
+
+The address-based reasons fire **only for links inside the donor's own site** — otherwise a
+legitimate placement pointing at your homepage would be thrown away. Anchor-based reasons
+fire for any link, because a footer or sidebar link to your domain with the anchor «Главная»
+is templated, not bought.
+
+Deliberately conservative: soft anchors («Подробнее», «Читать далее», «Узнать больше») are
+kept, since real placements often use them. Keep everything as upstream with
+`--nav-filter off`; dump the dropped rows with `--nav-out dropped.csv` and eyeball a sample.
+
 ## Options
 
 | Flag | Default | Description |
@@ -135,6 +171,8 @@ The stderr summary looks like this:
 | `--out` | `-` (stdout) | write CSV to a file instead |
 | `--workers` | `8` | parallel HTTP workers (1–64) |
 | `--insecure` | off | retry TLS failures with certificate verification **off** |
+| `--nav-filter` | `on` | `on` drops site navigation (menu, logo, footer, breadcrumbs, pagination) from the report; `off` = upstream behaviour |
+| `--nav-out` | — | optional CSV path to also write the rows dropped as navigation (for spot-checking) |
 
 At least one domain must be supplied via `--domains` or `--domains-file`.
 
@@ -163,8 +201,14 @@ python3 -m unittest -v
 ```
 
 Stdlib `unittest` against a local `http.server` — no network, no dependencies.
-44 tests covering matching, redirects, `<base>`, encodings, domain canonicalization,
-row semantics and CLI exit behaviour.
+44 upstream tests covering matching, redirects, `<base>`, encodings, domain canonicalization,
+row semantics and CLI exit behaviour, plus `test_nav_filter.py` with 23 tests for the
+navigation filter (reason classification, and the CLI switch via a real local scan).
+
+```bash
+python3 -m unittest -v                 # everything
+python3 -m unittest test_nav_filter    # filter only
+```
 
 ## Politeness
 
